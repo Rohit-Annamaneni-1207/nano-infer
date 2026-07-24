@@ -8,7 +8,7 @@ class KVCache:
         num_kv_heads: int, 
         head_dim: int, 
         dtype: torch.dtype = torch.float16, 
-        device: str = "cuda"
+        device: str = "mps"
     ):
         """
         Pre-allocates the Key and Value cache tensors for a single transformer layer.

@@ -301,3 +301,140 @@ $$ \text{Attention}(Q_i, K_i, V_i) = \text{softmax}\left(\frac{Q_i K_i^T}{\sqrt{
 
 **5. Reassembly**
 The 14 output matrices (each `[23, 64]`) are transposed and concatenated back into the original shape `[23, 896]` before moving to the output projection layer.
+
+## Concept 16: Speculative Decoding & Forward Pass Reduction
+
+In a standard autoregressive loop, generating $N$ tokens requires exactly $N$ forward passes of the target model. During the decode phase, the latency bottleneck is **memory-bandwidth**, not compute. Loading the massive weight matrices from RAM into the compute cores takes exponentially longer than the actual matrix multiplication. 
+
+Because of this hardware quirk, processing a batch of $K$ tokens in parallel takes almost the exact same amount of time as processing $1$ token. Speculative Decoding exploits this gap.
+
+### The Draft-and-Verify Architecture
+The engine runs two models simultaneously:
+1.  **The Draft Model:** A tiny, highly efficient model (e.g., 0.1B parameters).
+2.  **The Target Model:** The large, highly accurate main model (e.g., 0.5B or larger).
+
+The generation cycle shifts from token-by-token to a batched loop:
+1.  **Draft:** The tiny model autoregressively generates $K$ draft tokens (e.g., $K=4$). Because its weights are small, these $K$ forward passes are extremely fast.
+2.  **Verify:** The large target model takes all $K$ draft tokens and runs **one single parallel forward pass** (similar to a prefill phase) to generate the "true" logits for those $K$ positions, plus the $(K+1)$th position.
+3.  **Evaluate:** The engine compares the draft tokens against the target's true logits. It accepts tokens sequentially until the first mismatch. If a mismatch occurs at step $m$, it rejects token $m$ and everything after it, using the target's true token for step $m$ instead.
+
+### How It Reduces Forward Passes
+
+To understand the latency savings, we look at the number of heavy Target Model forward passes required to generate a sequence.
+
+**Standard Decoding (Without Speculation):**
+*   To generate 4 tokens, the target model must execute **4 sequential forward passes**. 
+*   The heavy weights are loaded into the cores 4 separate times.
+
+**Speculative Decoding (With $K=4$):**
+*   The draft model guesses 4 tokens.
+*   The target model evaluates all 4 tokens in **1 parallel forward pass**.
+*   **Best Case Scenario (All 4 Accepted):** The target model agrees with all 4 draft tokens. Because it also generated the logit for the 5th token during verification, we yield **5 tokens for the cost of 1 target forward pass**. We successfully skipped 4 heavy memory-loading cycles.
+*   **Worst Case Scenario (0 Accepted):** The target model disagrees with the very first draft token. We reject all draft tokens and use the target's correction. We yield **1 token for the cost of 1 target forward pass**. We lost a tiny amount of time running the draft model, but the target model latency remains unchanged.
+
+As long as the draft model has a reasonable acceptance rate (usually around 60-70%), the total number of target forward passes required to generate a full response is drastically reduced, functionally doubling or tripling the `tokens/sec` throughput.
+
+## Concept 17: The Latency Paradox of Speculative Decoding (Math vs. Memory)
+
+It seems counterintuitive that Speculative Decoding is faster, given that the draft model still must execute $K$ sequential forward passes. In fact, Speculative Decoding actually **increases the total amount of math (FLOPs)** the system performs (the math of the draft model + the math of the target model). 
+
+The reason this results in a speedup is the fundamental law of decode-phase inference: **Math is effectively free; moving memory is expensive.**
+
+### The Bottleneck: Reading Weights
+During token-by-token generation, the GPU cores spend most of their time sitting idle, waiting for the model's massive weight matrices to be transferred from RAM into the compute cores. 
+
+By introducing a tiny draft model, we are explicitly trading *heavy* memory reads for *cheap* memory reads.
+
+### A Hypothetical Latency Breakdown (Target: 7B vs. Draft: 0.1B)
+Assume we want to generate 4 tokens. 
+
+**Standard Decoding (4 Target Passes):**
+*   **Target Memory Read:** ~20 ms per forward pass.
+*   **Total Latency:** $20 \text{ ms} \times 4 \text{ passes} = \mathbf{80 \text{ ms}}$.
+
+**Speculative Decoding ($K=4$ Draft Passes + 1 Target Pass):**
+*   **Draft Memory Read:** Because the draft model is radically smaller (e.g., 70x smaller), loading its weights takes a fraction of the time—roughly ~2 ms per pass.
+*   **Draft Phase Latency:** $2 \text{ ms} \times 4 \text{ passes} = 8 \text{ ms}$.
+*   **Target Verification:** The target model loads its massive weights *once*. Verifying 4 tokens in parallel takes nearly the same time as generating 1 token (~21 ms).
+*   **Total Latency:** $8 \text{ ms (draft)} + 21 \text{ ms (verify)} = \mathbf{29 \text{ ms}}$.
+
+### The Trade-Off
+Even though the engine performed 5 total forward passes (4 draft + 1 target) instead of 4 target passes, the latency dropped from 80 ms to 29 ms. By accepting $K$ sequential forward passes on a tiny model, you successfully bypass $(K-1)$ sequential forward passes on a massive model. As long as the draft model's predictions are highly aligned with the target model, the overall `tokens/sec` throughput drastically increases.
+
+# Speculative Decoding: Custom PyTorch Inference Engine
+
+This document outlines the architecture, mathematics, and engineering hurdles of building a bare-metal, pointer-based speculative decoding engine for Large Language Models.
+
+---
+
+## 1. High-Level Architecture
+
+Standard autoregressive text generation is fundamentally **memory-bandwidth bound**. Every single token generated requires loading the entire model's weights from VRAM/Unified Memory into compute registers. 
+
+**Speculative Decoding** bypasses this by pairing two models:
+1. **The Draft Model (Small & Fast):** Generates $k$ candidate tokens sequentially using cheap forward passes.
+2. **The Target Model (Large & Accurate):** Evaluates all $k$ proposed tokens in a **single parallel forward pass**.
+
+By executing one heavy target pass for multiple proposed tokens, we trade sequential compute for parallel memory reads, significantly increasing Tokens/Second (Throughput) while mathematically guaranteeing the exact same output distribution as the target model alone.
+
+---
+
+## 2. Core Engineering Components
+
+* **Static, Pointer-Based KV Cache:** Instead of dynamic allocation, we pre-allocate fixed-size tensors: `(batch_size, num_kv_heads, max_seq_len, head_dim)`. An integer pointer (`current_pos`) tracks sequence progression and allows instant memory rollbacks when speculative tokens are rejected.
+* **Monkey-Patched Custom Attention:** We dynamically replace the Hugging Face `self_attn` methods at runtime. This allows us to inject our static KV cache, custom causal masking, and explicit Rotary Positional Embeddings (RoPE) without rewriting the core library source code.
+* **Greedy vs. Probabilistic Toggle:** 
+  * *Greedy (`do_sample=False`):* Uses strict equality checks between Draft and Target `argmax` predictions.
+  * *Top-P Sampling (`do_sample=True`):* Utilizes Modified Rejection Sampling to align the divergent probability distributions.
+
+---
+
+## 3. The Math of Modified Rejection Sampling
+
+When using Top-P sampling, the Draft model ($q(x)$) and Target model ($p(x)$) will rarely roll the exact same token. To maintain a high acceptance rate without degrading the output quality, we use Modified Rejection Sampling:
+
+1. **Calculate Ratio:** For a proposed token, calculate $r = \frac{p(x)}{q(x)}$.
+2. **Acceptance Coin Flip:** Accept the draft token if a uniform random sample falls below $r$.
+3. **Correction Sampling:** If rejected, we sample a replacement token from the residual distribution: $\max(0, p(x) - q(x))$.
+
+---
+
+## 4. Engineering Log: Troubles & Fixes
+
+Building this engine from scratch exposed several brutal edge cases in both LLM physics and hardware drivers. Here is how they were resolved.
+
+### Trouble 1: The KV Cache Duplication Bug
+**Symptom:** Identical draft and target models disagreed 74% of the time. Output was total gibberish.
+**Cause:** Passing the full prompt to the draft model to guess the next token resulted in the *last token of the prompt being written to the cache twice*.
+**Fix ("The N-1 Prefill"):** Prefill all tokens *except* the last one during initialization. Pass the final token to kickstart the speculative loop so it writes cleanly into the first empty memory slot.
+
+### Trouble 2: The Singleton Memory Overwrite
+**Symptom:** Acceptance rate dropped to 1.3%. 
+**Cause:** We accidentally instantiated a single `KVCache` object and passed it to all 24 layers of the model. Layer 1 was violently overwriting Layer 0's memory on the exact same tensor slice.
+**Fix:** Refactored the initialization loop to instantiate a mathematically unique `KVCache` object for every individual layer in both models.
+
+### Trouble 3: The Draft Cache Hole
+**Symptom:** The engine got stuck in a loop; acceptance rate crashed to 34%.
+**Cause:** When the Draft model proposed a token and the Target model accepted it, the Target model wrote it to memory, but the Draft model *never ingested it as an input*. This left a 1-token hole in the Draft model's causal history.
+**Fix:** Wrote a dynamic catch-up phase. If Draft tokens are accepted, we command the Draft model to execute one tiny forward pass on the final accepted token to "fill the hole" and align the cache pointers before the next loop.
+
+### Trouble 4: RoPE Phase Misalignment
+**Symptom:** Acceptance rate stalled at ~39% despite identical models.
+**Cause:** By bypassing Hugging Face's `generate()` wrapper, the model assumed it was starting a brand new sequence at $t=0$ on every loop step. The Positional Embeddings (RoPE) were applying "Token 0" rotations to "Token 95".
+**Fix:** Took manual control of sequence length tracking. Explicitly calculated and passed absolute `position_ids` into the `forward` passes for Prefill, Draft, Verify, and Hole-Fixing phases.
+
+### Trouble 5: Apple Silicon (MPS) `multinomial` Crash
+**Symptom:** `AcceleratorError: probability tensor contains either inf, nan or element < 0` during Top-P sampling.
+**Cause:** Apple's Metal Performance Shaders backend suffers from precision underflow when calculating cumulative sums (for `torch.multinomial`) over massive 152k vocabularies in `float16`. The hardware misinterpreted microscopic probabilities as `NaN` or negatives.
+**Fix:** Implemented a three-step hardware bypass:
+1. Upcast all logits to `float32` prior to softmax.
+2. Use `torch.nan_to_num()` to aggressively sanitize distributions.
+3. Offload the final `torch.multinomial` dice roll to the CPU to completely avoid the GPU driver bug.
+
+### Trouble 6: 0% Acceptance Rate on Mismatched Models
+**Symptom:** Pairing a 1.5B Target with a 0.5B Draft using Top-P sampling resulted in a 0% acceptance rate.
+**Cause:** The 0.5B model's proposed probability distribution deviated too heavily from the 1.5B model's expectations, causing Modified Rejection Sampling to fail every coin flip.
+**Fix:** 
+1. Added a strict toggle between Greedy (deterministic) and Top-P (probabilistic) decoding.
+2. Tuned the Draft window down to $k=2$ for mismatched models to prevent excessive speculative drift.
+3. Ensured pairing of equivalent model alignments (e.g., Instruct Target with Instruct Draft).

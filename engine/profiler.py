@@ -51,3 +51,43 @@ class InferenceProfiler:
         for phase, mem in self.metrics.items():
             print(f"Peak VRAM ({phase})   : {mem:.2f} MB")
         print("="*40 + "\n")
+
+# engine/profiler.py
+
+class SpeculativeProfiler:
+    """
+    Analyzes the telemetry from the SpeculativeEngine to quantify latency savings.
+    """
+    @staticmethod
+    def print_report(generated_tokens: list[int], stats: dict):
+        total_tokens = len(generated_tokens)
+        
+        # 1. Base Metrics
+        decode_time = stats["decode_time"]
+        tokens_per_sec = total_tokens / decode_time if decode_time > 0 else 0
+        
+        # 2. Speculation Metrics
+        proposed = stats["draft_tokens_proposed"]
+        accepted = stats["draft_tokens_accepted"]
+        acceptance_rate = (accepted / proposed * 100) if proposed > 0 else 0
+        
+        # 3. Hardware Savings
+        target_passes = stats["target_forward_passes"]
+        # In a standard autoregressive loop, generating N tokens requires N forward passes.
+        saved_passes = total_tokens - target_passes
+        
+        print("\n" + "="*40)
+        print(" ⚡ SPECULATIVE DECODING PROFILER ⚡")
+        print("="*40)
+        print(f"Total Tokens Generated: {total_tokens}")
+        print(f"Time To First Token:    {stats['ttft'] * 1000:.2f} ms")
+        print(f"Decode Time:            {decode_time:.2f} s")
+        print(f"Throughput:             {tokens_per_sec:.2f} tok/sec")
+        print("-" * 40)
+        print(f"Draft Tokens Proposed:  {proposed}")
+        print(f"Draft Tokens Accepted:  {accepted}")
+        print(f"Acceptance Rate:        {acceptance_rate:.1f}%")
+        print("-" * 40)
+        print(f"Target Forward Passes:  {target_passes}")
+        print(f"Forward Passes Saved:   {saved_passes} (Skipped heavy memory reads)")
+        print("="*40 + "\n")

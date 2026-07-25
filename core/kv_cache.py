@@ -73,3 +73,14 @@ class KVCache:
         Old data will simply be overwritten on the next update.
         """
         self.current_pos = 0
+
+        
+    def set_position(self, new_pos: int):
+        """
+        Rolls the active sequence length pointer to a specific position.
+        Any data existing after new_pos is functionally 'deleted' 
+        because it will be overwritten on the next pass.
+        """
+        if new_pos < 0 or new_pos > self.max_seq_len:
+            raise ValueError(f"Invalid rollback position: {new_pos}")
+        self.current_pos = new_pos
